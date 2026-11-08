@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>My LivLiv Player 미리보기</title>
+  <link rel="stylesheet" href="./preview.css">
+</head>
+<body>
+  <header>
+    <div>
+      <strong>공식 LivLiv Player</strong>
+      <span>로컬 미리보기 · Player 0.3.0</span>
+    </div>
+    <output id="status" role="status" aria-live="polite">플레이어를 준비하고 있습니다.</output>
+  </header>
+  <main>
+    <canvas id="player" aria-label="LivLiv 캐릭터 미리보기"></canvas>
+    <div id="empty" class="empty">파츠를 나눈 뒤 <b>Player 미리보기 만들기</b>를 누르세요.</div>
+  </main>
+  <script type="module" src="./preview.js"></script>
+</body>
+</html>

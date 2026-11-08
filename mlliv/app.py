@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal, QUrl
 from PySide6.QtGui import QAction, QBrush, QColor, QImage, QImageReader, QPainter, QPen, QPixmap
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QSlider, QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QPushButton, QSlider, QSplitter, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 from .core import GROUPS, ImageDocument, Layer, composite_image, remove_border_background, validate_image_size
 from .package_io import export_livliv, load_project, save_project
+from .player_preview import LocalPreviewServer, PreviewBuildWorker, snapshot_document
 
 
 GROUP_LABELS = {
@@ -211,6 +213,19 @@ class MainWindow(QMainWindow):
         self.redo_stack: list[list[tuple[str, str, QImage, bool]]] = []
 
         self.canvas = ImageCanvas()
+        self.preview_server = LocalPreviewServer()
+        self.preview_server.start()
+        self._preview_worker: PreviewBuildWorker | None = None
+        self._player_page_ready = False
+        self._player_package_ready = False
+        self._pending_player_load = False
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.addTab(self.canvas, "파츠 편집")
+        self.player_view = QWebEngineView()
+        self.player_view.loadFinished.connect(self._player_page_loaded)
+        self.preview_tabs.addTab(self.player_view, "공식 Player 미리보기")
+        self.player_view.load(QUrl(self.preview_server.url))
+
         self.canvas.changed.connect(self._mark_dirty)
         self.canvas.on_edit_start = self._push_undo
         self.canvas.on_head_box = self._head_box_updated
@@ -300,16 +315,50 @@ class MainWindow(QMainWindow):
         form.addRow("고개 회전", self.turn_slider)
         note = QLabel(
             "이 미리보기는 편집 마스크의 2D 회전 확인용입니다.\n"
-            "LivLiv Player 렌더러, 눈·입 인식, 생성형 복원은 아직 연결되지 않았습니다.\n"
+            "오른쪽의 공식 Player 탭에서는 내보낼 모델을 실제 렌더링할 수 있습니다.\n"
             "머리 영역은 드래그로 직접 지정하고, 파츠는 브러시로 나누세요."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#9fb0c3; padding:8px; background:#1c2632; border-radius:6px;")
         form.addRow(note)
 
+        form.addRow(QLabel("<b>LivLiv Player 미리보기</b>"))
+        self.preview_build_button = QPushButton("Player 미리보기 생성 / 갱신")
+        self.preview_build_button.clicked.connect(self.build_player_preview)
+        form.addRow(self.preview_build_button)
+        self.player_sliders: dict[str, QSlider] = {}
+        for key, label, low, high, initial in (
+            ("angleX", "좌우 회전", -30, 30, 0),
+            ("angleY", "위아래 회전", -30, 30, 0),
+            ("angleZ", "기울이기", -30, 30, 0),
+            ("eyeLOpen", "눈 뜨기", 0, 100, 100),
+            ("mouthOpen", "입 열기", 0, 100, 0),
+            ("smile", "미소", 0, 100, 0),
+        ):
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(low, high)
+            slider.setValue(initial)
+            slider.valueChanged.connect(self._player_params_changed)
+            self.player_sliders[key] = slider
+            form.addRow(label, slider)
+        player_buttons = QWidget()
+        player_buttons_row = QHBoxLayout(player_buttons)
+        player_buttons_row.setContentsMargins(0, 0, 0, 0)
+        for label, callback in (("깜빡임", self._player_blink),
+                                ("끄덕임", lambda: self._player_action("nod")),
+                                ("초기화", self._reset_player_params)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            player_buttons_row.addWidget(button)
+        form.addRow(player_buttons)
+        self.player_controls_note = QLabel("Player 파라미터는 모델에 해당 파츠가 있을 때 반영됩니다.")
+        self.player_controls_note.setWordWrap(True)
+        self.player_controls_note.setStyleSheet("color:#9fb0c3; padding:4px;")
+        form.addRow(self.player_controls_note)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
-        splitter.addWidget(self.canvas)
+        splitter.addWidget(self.preview_tabs)
         splitter.addWidget(right)
         splitter.setSizes([250, 920, 300])
         self.setCentralWidget(splitter)
@@ -337,9 +386,86 @@ class MainWindow(QMainWindow):
         self.mode_combo.setEnabled(enabled)
         self.brush_slider.setEnabled(enabled)
         self.turn_slider.setEnabled(enabled)
+        self.preview_build_button.setEnabled(enabled and self._preview_worker is None)
+        for slider in self.player_sliders.values():
+            slider.setEnabled(enabled)
 
     def _status(self, text: str) -> None:
         self.statusBar().showMessage(text, 12_000)
+
+    def _player_page_loaded(self, ok: bool) -> None:
+        self._player_page_ready = ok
+        if not ok:
+            self._status("LivLiv Player 페이지를 열지 못했습니다. Player 자산 폴더를 확인하세요.")
+            return
+        if self._pending_player_load and self._player_package_ready:
+            self._load_latest_player_package()
+
+    def _load_latest_player_package(self) -> None:
+        if not self._player_page_ready or not self._player_package_ready:
+            return
+        self._pending_player_load = False
+        self.player_view.page().runJavaScript("window.MyLivLivPreview?.loadLatest();")
+        self.preview_tabs.setCurrentWidget(self.player_view)
+
+    def build_player_preview(self) -> None:
+        if not self.document:
+            return
+        if self._preview_worker is not None:
+            self._status("Player 미리보기를 만들고 있습니다. 잠시 기다려 주세요.")
+            return
+        self.preview_build_button.setEnabled(False)
+        self._status("LivLiv v4 패키지를 만들고 공식 Player 미리보기를 준비합니다…")
+        snapshot = snapshot_document(self.document)
+        model_name = Path(self.document.source_name).stem[:64]
+        worker = PreviewBuildWorker(snapshot, model_name, self)
+        self._preview_worker = worker
+        worker.package_ready.connect(self._player_package_built)
+        worker.failed.connect(self._player_package_failed)
+        worker.finished.connect(lambda worker=worker: self._preview_worker_finished(worker))
+        worker.start()
+
+    def _player_package_built(self, package: bytes) -> None:
+        self.preview_server.set_package(package)
+        self._player_package_ready = True
+        self._pending_player_load = True
+        self._status("미리보기 패키지를 만들었습니다. 공식 Player에서 렌더링합니다.")
+        self._load_latest_player_package()
+
+    def _player_package_failed(self, message: str) -> None:
+        self._status(f"Player 미리보기 생성 실패: {message}")
+
+    def _preview_worker_finished(self, worker: PreviewBuildWorker) -> None:
+        if self._preview_worker is worker:
+            self._preview_worker = None
+        worker.deleteLater()
+        self.preview_build_button.setEnabled(self.document is not None)
+
+    def _run_player_javascript(self, source: str) -> None:
+        if self._player_page_ready:
+            self.player_view.page().runJavaScript(source)
+
+    def _player_params_changed(self, _value: int = 0) -> None:
+        values: dict[str, float] = {}
+        for key, slider in self.player_sliders.items():
+            value = slider.value()
+            if key in {"eyeLOpen", "mouthOpen", "smile"}:
+                value /= 100
+            values[key] = value
+        values["eyeROpen"] = values["eyeLOpen"]
+        self._run_player_javascript(f"window.MyLivLivPreview?.setParams({values!r});")
+
+    def _player_blink(self) -> None:
+        self._run_player_javascript("window.MyLivLivPreview?.blink();")
+
+    def _player_action(self, name: str) -> None:
+        if name in {"nod", "shake", "tilt", "hop", "shy"}:
+            self._run_player_javascript(f"window.MyLivLivPreview?.action({name!r});")
+
+    def _reset_player_params(self) -> None:
+        for key, value in (("angleX", 0), ("angleY", 0), ("angleZ", 0),
+                           ("eyeLOpen", 100), ("mouthOpen", 0), ("smile", 0)):
+            self.player_sliders[key].setValue(value)
 
     def _push_undo(self) -> None:
         if not self.document:
@@ -552,11 +678,15 @@ class MainWindow(QMainWindow):
         try:
             model_name = Path(self.document.source_name).stem[:64]
             model = export_livliv(self.document, path, model_name)
+            self.preview_server.set_package(path.read_bytes())
+            self._player_package_ready = True
+            self._pending_player_load = True
             message = f"v4 패키지를 생성하고 내부 구조를 확인했습니다.\n\n{path}\n파츠: {len(model['layers'])}개\n캔버스: {model['canvas'][0]} × {model['canvas'][1]}px"
             if not self.document.head_box:
                 message += "\n\n머리 앵커를 지정하지 않아 전체 캐릭터 경계를 임시 앵커로 사용했습니다. 정확한 움직임을 위해 머리 앵커를 지정한 뒤 다시 내보내세요."
             QMessageBox.information(self, "내보내기 완료", message)
             self._status(f"LivLiv 모델 내보내기 완료: {path.name}")
+            self._load_latest_player_package()
         except Exception as error:
             QMessageBox.critical(self, "모델 내보내기 실패", str(error))
 
@@ -617,6 +747,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
+            if self._preview_worker is not None and not self._preview_worker.wait(10_000):
+                self._status("Player 미리보기를 만드는 중입니다. 잠시 후 다시 닫아 주세요.")
+                event.ignore()
+                return
+            self.preview_server.close()
             event.accept()
         else:
             event.ignore()

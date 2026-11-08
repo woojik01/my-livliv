@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
+import os
 import re
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -192,7 +195,7 @@ def build_model(document: ImageDocument, name: str = "My LivLiv 캐릭터", lice
 
 
 def validate_model(model: dict[str, Any]) -> None:
-    """Strict local checks; the full vendored v4 JSON Schema is used when jsonschema is installed."""
+    """Validate the model structure and the vendored official v4 JSON Schema."""
     allowed = {"format", "version", "name", "meta", "requires", "files", "canvas", "profile", "rig", "tuning", "anchors", "expressions", "layers"}
     if any(key not in allowed and not key.startswith("x-") for key in model):
         raise ValueError("LivLiv model.json에 스키마에 없는 최상위 필드가 있습니다.")
@@ -231,33 +234,60 @@ def validate_model(model: dict[str, Any]) -> None:
             raise ValueError("파츠 위치 또는 크기가 캔버스 범위를 벗어났습니다.")
     try:
         import jsonschema
-    except ImportError:
-        return
+    except ImportError as error:
+        raise RuntimeError("공식 LivLiv 스키마 검증을 위해 requirements.txt 의존성을 설치하세요.") from error
     schema_path = Path(__file__).resolve().parents[1] / "schemas" / "livliv-model-v4.json"
-    if schema_path.exists():
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        jsonschema.Draft202012Validator(schema).validate(model)
+    if not schema_path.is_file():
+        raise RuntimeError(f"공식 LivLiv v4 스키마 파일이 없습니다: {schema_path}")
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.Draft202012Validator(schema).validate(model)
 
 
-def export_livliv(document: ImageDocument, path: str | Path, name: str = "My LivLiv 캐릭터", license_id: str | None = None) -> dict[str, Any]:
+def build_livliv_bytes(document: ImageDocument, name: str = "My LivLiv 캐릭터", license_id: str | None = None) -> tuple[dict[str, Any], bytes]:
     model, texture_entries = build_model(document, name, license_id)
     model_bytes = json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8")
     if len(model_bytes) > 4 * 1024 * 1024:
         raise ValueError("model.json이 플레이어의 4MB 제한을 초과합니다.")
-    path = Path(path)
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as archive:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as archive:
         archive.writestr("model.json", model_bytes, compress_type=zipfile.ZIP_STORED)
         for name_, payload in texture_entries:
             archive.writestr(name_, payload, compress_type=zipfile.ZIP_STORED)
-    validate_livliv_package(path)
+    payload = buffer.getvalue()
+    validate_livliv_package(payload)
+    return model, payload
+
+
+def export_livliv(document: ImageDocument, path: str | Path, name: str = "My LivLiv 캐릭터", license_id: str | None = None) -> dict[str, Any]:
+    model, payload = build_livliv_bytes(document, name, license_id)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False) as temporary:
+            temporary_path = temporary.name
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        raise
     return model
 
 
-def validate_livliv_package(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    if path.stat().st_size > MAX_PACKAGE_TOTAL:
+def validate_livliv_package(source: str | Path | bytes | bytearray | memoryview) -> dict[str, Any]:
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        package_source: str | Path | io.BytesIO = io.BytesIO(bytes(source))
+        package_size = len(source)
+    else:
+        package_source = Path(source)
+        package_size = package_source.stat().st_size
+    if package_size > MAX_PACKAGE_TOTAL:
         raise ValueError(".livliv 패키지가 256MB를 초과합니다.")
-    with zipfile.ZipFile(path, "r") as archive:
+    with zipfile.ZipFile(package_source, "r") as archive:
         infos = archive.infolist()
         if not 1 <= len(infos) <= 2048:
             raise ValueError("패키지 파일 수가 LivLiv Player 제한을 벗어났습니다.")

@@ -4,4 +4,7 @@ The file schemas/livliv-model-v4.json is reproduced from livliv-dev/player at ht
 revision 0f2c8871de375dfe4d239fab480e07f6d9b032dd, under Apache License 2.0. The corresponding upstream license and notice
 are preserved under licenses/.
 
-No LivLiv Player renderer source, sample character artwork, or model weights are bundled in this project.
+The project includes only the browser distribution entry point and required JavaScript chunks from the npm package
+@livliv-dev/player@0.3.0 for the embedded preview at runtime/vendor/player-0.3.0/dist/. The original package LICENSE and
+NOTICE are included beside those files; the npm archive integrity value is recorded in runtime/package-lock.json.
+No upstream sample character artwork, optional AI/VRM peer dependencies, or model weights are included.

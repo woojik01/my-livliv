@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -10,7 +12,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 
 from mlliv.core import ImageDocument, Layer, alpha_mask, remove_border_background
-from mlliv.package_io import export_livliv, load_project, save_project, validate_livliv_package
+from mlliv.package_io import build_livliv_bytes, export_livliv, load_project, save_project, validate_livliv_package
+from mlliv.player_preview import LocalPreviewServer
 
 
 def synthetic_character() -> QImage:
@@ -76,6 +79,39 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(checked["canvas"], [192, 256])
         self.assertEqual([image.width(), image.height()], [layer["w"], layer["h"]])
         self.assertEqual(model["anchors"]["face"], [54, 45, 140, 145])
+
+    def test_in_memory_package_build_uses_official_schema_validation(self):
+        source = synthetic_character()
+        mask, _ = remove_border_background(source, 26)
+        doc = ImageDocument(source, "synthetic.png", [Layer("Body", "body", mask)])
+        doc.head_box = (54, 45, 140, 145)
+        model, package = build_livliv_bytes(doc, "Synthetic Preview")
+        checked = validate_livliv_package(package)
+        self.assertEqual(model["version"], 4)
+        self.assertEqual(checked["name"], "Synthetic Preview")
+        self.assertGreater(len(package), 0)
+
+    def test_preview_server_serves_package_at_token_url_with_restrictive_headers(self):
+        source = synthetic_character()
+        mask, _ = remove_border_background(source, 26)
+        doc = ImageDocument(source, "synthetic.png", [Layer("Body", "body", mask)])
+        _model, package = build_livliv_bytes(doc, "Synthetic Preview")
+        server = LocalPreviewServer()
+        server.set_package(package)
+        server.start()
+        try:
+            with urllib.request.urlopen(server.url + "api/model.livliv", timeout=3) as response:
+                self.assertEqual(response.read(), package)
+                self.assertEqual(response.headers.get_content_type(), "application/zip")
+                self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
+            try:
+                urllib.request.urlopen(server.url.rsplit("/", 2)[0] + "/wrong/api/model.livliv", timeout=3)
+                self.fail("A request without the per-run token should not be served.")
+            except urllib.error.HTTPError as error:
+                self.assertEqual(error.code, 404)
+                error.close()
+        finally:
+            server.close()
 
     def test_empty_mask_is_not_exported(self):
         source = synthetic_character()

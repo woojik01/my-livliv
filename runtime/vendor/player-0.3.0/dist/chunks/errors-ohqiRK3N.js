@@ -1,0 +1,1 @@
+var e=class extends Error{code;status;constructor(e,t,n={}){super(t,n.cause===void 0?void 0:{cause:n.cause}),this.name=`LivLivError`,this.code=e,n.status!==void 0&&(this.status=n.status)}};export{e as t};

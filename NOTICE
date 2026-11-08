@@ -1,0 +1,7 @@
+My LivLiv is an independent community project. It is not an official LivLiv.ai product and is not affiliated with LivLiv.ai.
+
+The file schemas/livliv-model-v4.json is reproduced from livliv-dev/player at https://github.com/livliv-dev/player,
+revision 0f2c8871de375dfe4d239fab480e07f6d9b032dd, under Apache License 2.0. The corresponding upstream license and notice
+are preserved under licenses/.
+
+No LivLiv Player renderer source, sample character artwork, or model weights are bundled in this project.
